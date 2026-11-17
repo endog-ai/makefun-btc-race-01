@@ -15,10 +15,15 @@
 //   3. MOMENTUM: price above both EMAs AND the 60-minute return >= +0.30%.
 //      One hour of real upward drift, not a one-minute spike.
 //   4. EXITS (asymmetric, the edge): take-profit +1.5% from the entry close
-//      banks a real move; a trailing stop -1.0% from the peak close caps the
-//      damage when a trend reverses. Wins are ~2x the losses.
+//      banks a real move; a trailing stop -1.0% from the peak caps the
+//      damage when a trend reverses. The trailing peak ratchets on each bar's
+//      HIGH, not just its close, so the stop protects intrabar gains the close
+//      alone would miss. Wins are ~2x the losses.
 //   5. ANTI-WHIPSHAW: 30-bar cooldown after every exit, at most 4 round trips
-//      per 24 h, full-size only (no scaling in/out — every fill costs).
+//      per 24 h, full-size only (no scaling in/out — every fill costs), and no
+//      new position in the final hour of the window: a trade opened there has
+//      almost no time to reach take-profit before the forced flatten at the
+//      close, so it is a low-expected-value gamble on the day's profit.
 //
 // All comparisons are exact BigInt integer math (EMAs in fixed point, scale
 // 1e6). No clock, no environment, no randomness: two runs on the same data
@@ -42,6 +47,9 @@ const TRAIL_DEN = 100n;
 const FRESH_WINDOW = 1; // enter on the cross bar or the bar right after it
 const COOLDOWN_BARS = 30;
 const MAX_TRIPS = 4;
+// The race window is 24 h of 1-min bars (1440 scored bars). No new position once
+// more than 1380 scored bars have passed, i.e. in the final 60 bars (last hour).
+const NO_ENTRY_AFTER_SCORED = 1380;
 const MAX_SLIPPAGE_BPS = 150;
 const SCALE = 1000000n; // fixed-point scale for EMAs
 
@@ -53,7 +61,7 @@ type Tide = {
   lastCross: number; // bar index of the last fresh cross up
   inPos: boolean;
   entryClose: bigint; // close at the entry-decision bar
-  peakClose: bigint; // highest close since entry
+  peakClose: bigint; // highest bar high since entry (trailing-stop peak)
   coolUntil: number; // bar index; no entry before this
   trips: number; // completed round trips (exits decided)
   pendingBuyId: string | null;
@@ -136,7 +144,10 @@ await runBars({
 
     // --- exit: take-profit or trailing stop (checked on every close while in) ---
     if (tide.inPos) {
-      if (close > tide.peakClose) tide.peakClose = close;
+      // Ratchet the trailing peak on the bar's high: it is the true intrabar peak,
+      // so a spike that fades before the close still lifts the stop that protects it.
+      const high = BigInt(bar.h);
+      if (high > tide.peakClose) tide.peakClose = high;
       const takeProfit = close * TP_DEN >= tide.entryClose * TP_NUM;
       const trailingStop = close * TRAIL_DEN <= tide.peakClose * TRAIL_NUM;
       if (takeProfit || trailingStop) {
@@ -161,6 +172,9 @@ await runBars({
     // --- entry: all signals must agree ---
     if (idx < tide.coolUntil) return [];
     if (tide.trips >= MAX_TRIPS) return [];
+    // Final hour of the scored window: no new position. Scored bars are counted
+    // from the end of the warm-up, so this holds with or without one.
+    if (state.seq - state.warmupBars > NO_ENTRY_AFTER_SCORED) return [];
     if (!above) return [];
     if (close * SCALE <= (tide.emaFast as bigint)) return []; // price above fast EMA
     if (close * SCALE <= (tide.emaSlow as bigint)) return []; // price above slow EMA
